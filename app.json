@@ -1,24 +1,76 @@
 {
   "expo": {
-    "name": "MyPA",
+    "name": "myPA",
     "slug": "MyPA",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mypa.assistant",
+      "infoPlist": {
+        "NSSpeechRecognitionUsageDescription": "myPA uses speech recognition to turn your voice into messages.",
+        "NSMicrophoneUsageDescription": "myPA uses the microphone so you can talk to your assistant."
+      }
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#5B4DF0",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "package": "com.mypa.assistant",
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-notifications",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "myPA uses the microphone so you can talk to your assistant.",
+          "speechRecognitionPermission": "myPA uses speech recognition to turn your voice into messages."
+        }
+      ],
+      "@react-native-community/datetimepicker",
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "myPA uses your contacts so you can pick who to text or call."
+        }
+      ],
+      [
+        "react-native-android-widget",
+        {
+          "widgets": [
+            {
+              "name": "Agenda",
+              "label": "myPA Agenda",
+              "description": "Today's events and open tasks, with a quick add button.",
+              "minWidth": "250dp",
+              "minHeight": "110dp",
+              "targetCellWidth": 4,
+              "targetCellHeight": 2,
+              "resizeMode": "horizontal|vertical",
+              "updatePeriodMillis": 1800000
+            }
+          ]
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4ddf46bb-081b-4361-a09e-c9309f12ba85"
+      }
+    },
+    "owner": "makilagied",
+    "scheme": "mypa"
   }
 }
