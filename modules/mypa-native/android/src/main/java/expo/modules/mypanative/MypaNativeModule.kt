@@ -32,8 +32,8 @@ class MypaNativeModule : Module() {
       SmsScheduler.schedule(context, SmsJob(id, number, message, atMillis.toLong(), repeat, subId.toInt()), persist = true)
     }
 
-    Function("scheduleCall") { id: String, number: String, atMillis: Double, repeat: String ->
-      SmsScheduler.schedule(context, SmsJob(id, number, "", atMillis.toLong(), repeat, -1, "call"), persist = true)
+    Function("scheduleCall") { id: String, number: String, atMillis: Double, repeat: String, subId: Double ->
+      SmsScheduler.schedule(context, SmsJob(id, number, "", atMillis.toLong(), repeat, subId.toInt(), "call"), persist = true)
     }
 
     Function("cancelSms") { id: String ->
@@ -70,11 +70,11 @@ class MypaNativeModule : Module() {
     }
 
     // ----- calls -----
-    Function("callNumber") { number: String ->
+    Function("callNumber") { number: String, subId: Double ->
       if (context.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
         false
       } else {
-        launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number))))
+        context.startActivity(SmsScheduler.callIntent(context, number, subId.toInt()))
         true
       }
     }

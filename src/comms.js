@@ -64,11 +64,11 @@ export const recipientsOf = (t) =>
   t.recipients && t.recipients.length ? t.recipients : t.number ? [{ name: t.name || '', number: t.number }] : [];
 
 // ---------- calls ----------
-export function placeCall(number, name) {
+export function placeCall(number, name, subId = -1) {
   const go = async () => {
     if (Native) {
       const res = await PermissionsAndroid.request(P.CALL_PHONE);
-      if (res === GRANTED && Native.callNumber(normalizeNumber(number))) return;
+      if (res === GRANTED && Native.callNumber(normalizeNumber(number), subId)) return;
     }
     Linking.openURL(`tel:${normalizeNumber(number)}`); // falls back to the dialer
   };
@@ -92,7 +92,7 @@ export function syncTexts(texts) {
       if (!at || at.getTime() <= now) continue;
       const numbers = recipientsOf(t).map((r) => normalizeNumber(r.number)).filter(Boolean).slice(0, MAX_RECIPIENTS).join(',');
       if (!numbers) continue;
-      if (typeOf(t) === 'call') Native.scheduleCall(t.id, numbers.split(',')[0], at.getTime(), t.repeat || 'none');
+      if (typeOf(t) === 'call') Native.scheduleCall(t.id, numbers.split(',')[0], at.getTime(), t.repeat || 'none', t.sim && t.sim.subId != null ? t.sim.subId : -1);
       else Native.scheduleSms(t.id, numbers, t.message, at.getTime(), t.repeat || 'none', t.sim && t.sim.subId != null ? t.sim.subId : -1);
     }
     return true;

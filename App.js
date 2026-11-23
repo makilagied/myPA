@@ -936,7 +936,7 @@ function TextSheet({ s, T, item, isNew, onSave, onClose }) {
     onSave({
       recipients: list, name: list[0].name || '', number: list.map((r) => r.number).join(', '),
       type, channel: type === 'text' ? channel : 'sms', message: type === 'call' ? '' : message.trim(), at: when, repeat,
-      sim: type === 'text' && channel === 'sms' ? sim : null,
+      sim: type === 'call' || channel === 'sms' ? sim : null,
     });
   };
 
@@ -1018,9 +1018,9 @@ function TextSheet({ s, T, item, isNew, onSave, onClose }) {
               ))}
             </View>
 
-            {nativeAvailable && type === 'text' && channel === 'sms' && (
+            {nativeAvailable && (type === 'call' || channel === 'sms') && (
               <>
-                <Text style={s.label}>Send from</Text>
+                <Text style={s.label}>{type === 'call' ? 'Call from' : 'Send from'}</Text>
                 {sims === null ? (
                   <Pressable style={[s.dtChip, { alignSelf: 'flex-start', marginBottom: 14 }]} onPress={loadSims}>
                     <Text style={s.dtText}>{sim ? `SIM ${sim.slot}` : 'Phone default'}  ·  Choose SIM…</Text>

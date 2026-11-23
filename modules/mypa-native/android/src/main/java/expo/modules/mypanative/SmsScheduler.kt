@@ -207,10 +207,10 @@ object SmsScheduler {
     val canStart = hasCallPerm && Settings.canDrawOverlays(ctx)
     try {
       if (canStart) {
-        ctx.startActivity(Intent(Intent.ACTION_CALL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        ctx.startActivity(callIntent(ctx, job.number, job.subId))
         addResult(ctx, job.id, "sent", null)
       } else {
-        val tap = Intent(if (hasCallPerm) Intent.ACTION_CALL else Intent.ACTION_DIAL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val tap = if (hasCallPerm) callIntent(ctx, job.number, job.subId) else Intent(Intent.ACTION_DIAL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val pi = PendingIntent.getActivity(ctx, job.id.hashCode(), tap, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         notify(ctx, "Time for your scheduled call", "Tap to call now", pi)
         addResult(ctx, job.id, "failed", "Could not start the call by itself. Allow 'Display over other apps' for myPA. A tap-to-call notification was shown.")
@@ -219,6 +219,31 @@ object SmsScheduler {
       addResult(ctx, job.id, "failed", e.message ?: e.javaClass.simpleName)
     }
     advance(ctx, job)
+  }
+
+  /** ACTION_CALL that dials from the chosen SIM (subId < 0 = the phone's default calling SIM). */
+  fun callIntent(ctx: Context, number: String, subId: Int): Intent {
+    val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number.trim()))).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    if (subId >= 0) {
+      try {
+        val handle = phoneAccountFor(ctx, subId)
+        if (handle != null) intent.putExtra(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+      } catch (_: Exception) {}
+    }
+    return intent
+  }
+
+  @android.annotation.SuppressLint("MissingPermission")
+  private fun phoneAccountFor(ctx: Context, subId: Int): android.telecom.PhoneAccountHandle? {
+    val tm = ctx.getSystemService(Context.TELECOM_SERVICE) as android.telecom.TelecomManager
+    val tel = ctx.getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
+    val accounts = tm.callCapablePhoneAccounts
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      accounts.firstOrNull { tel.getSubscriptionId(it) == subId }?.let { return it }
+    }
+    val info = (ctx.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as android.telephony.SubscriptionManager)
+      .activeSubscriptionInfoList?.firstOrNull { it.subscriptionId == subId } ?: return null
+    return accounts.firstOrNull { it.id == info.iccId || it.id == subId.toString() } ?: accounts.getOrNull(info.simSlotIndex)
   }
 
   fun canDrawOverlays(ctx: Context): Boolean = Settings.canDrawOverlays(ctx)
