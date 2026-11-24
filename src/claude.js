@@ -6,7 +6,7 @@ const REPEAT_PROP = { type: 'string', enum: ['none', 'daily', 'weekly', 'monthly
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-5-5';
 
-const TOOLS = [
+export const TOOLS = [
   {
     name: 'add_task',
     description: 'Add a to-do task for the user. Use for things they need to do.',
@@ -76,7 +76,7 @@ const TOOLS = [
   },
 ];
 
-function runTool(name, input, data) {
+export function runTool(name, input, data) {
   // returns { result, data } — data is a new object if modified
   const next = { ...data, tasks: [...data.tasks], notes: [...data.notes], events: [...data.events] };
   switch (name) {
@@ -129,11 +129,11 @@ function runTool(name, input, data) {
   }
 }
 
-function systemPrompt(userName, assistantName) {
+export function systemPrompt(userName, assistantName) {
   const now = new Date();
   return `You are ${assistantName || 'Jolly'}, a personal assistant (inside the myPA app) who works as ${userName ? userName + "'s" : "the user's"} secretary.
 Current date/time: ${now.toString()} (ISO: ${now.toISOString()}).
-Be warm, concise, and proactive. Use your tools to manage tasks, calendar events and notes whenever the user asks you to remember, schedule or track something — don't just say you did it. Resolve relative dates ("tomorrow", "next Friday") into concrete dates using the current time. Before answering questions about what's on their plate, call the list tools. Ask a short clarifying question only if essential info (like a time) is missing and can't be reasonably assumed.`;
+Be warm, concise, and proactive. Use your tools to manage tasks, calendar events and notes whenever the user asks you to remember, schedule or track something — don't just say you did it. Resolve relative dates ("tomorrow", "next Friday") into concrete dates using the current time. Before answering questions about what's on their plate, call the list tools. Always reply in the same language the user writes in (for example Kiswahili, English, or a mix); if they switch language, switch with them. Keep item titles in the language the user used. Ask a short clarifying question only if essential info (like a time) is missing and can't be reasonably assumed.`;
 }
 
 /**

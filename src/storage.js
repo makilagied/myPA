@@ -21,15 +21,19 @@ export async function saveData(data) {
   await AsyncStorage.setItem(DATA_KEY, JSON.stringify(data));
 }
 
-// API key: encrypted storage on device (falls back to AsyncStorage on web)
-export async function getApiKey() {
-  if (Platform.OS === 'web') return (await AsyncStorage.getItem(KEY_NAME)) || '';
-  return (await SecureStore.getItemAsync(KEY_NAME)) || '';
+// API keys: encrypted storage on device (falls back to AsyncStorage on web). One per provider.
+const keyName = (provider) => (provider === 'gemini' ? 'mypa.geminikey' : KEY_NAME);
+
+export async function getApiKey(provider = 'claude') {
+  const k = keyName(provider);
+  if (Platform.OS === 'web') return (await AsyncStorage.getItem(k)) || '';
+  return (await SecureStore.getItemAsync(k)) || '';
 }
 
-export async function setApiKey(key) {
-  if (Platform.OS === 'web') return AsyncStorage.setItem(KEY_NAME, key);
-  return SecureStore.setItemAsync(KEY_NAME, key);
+export async function setApiKey(key, provider = 'claude') {
+  const k = keyName(provider);
+  if (Platform.OS === 'web') return AsyncStorage.setItem(k, key);
+  return SecureStore.setItemAsync(k, key);
 }
 
 export async function getUserName() {
@@ -74,7 +78,7 @@ export async function setAssistantName(name) {
 export const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
 const PREFS_KEY = 'mypa.prefs';
-export const defaultPrefs = { theme: 'system', reminders: true, briefing: false, briefingTime: '08:00' };
+export const defaultPrefs = { theme: 'system', reminders: true, briefing: false, briefingTime: '08:00', voiceLang: 'en-US', provider: 'claude', geminiModel: 'gemini-flash-latest' };
 
 export async function getPrefs() {
   try {

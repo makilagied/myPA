@@ -10,6 +10,7 @@ import { Linking, Modal } from 'react-native';
 import DateTimePicker, { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 import * as Notifications from 'expo-notifications';
 import { REPEATS, REPEAT_LABEL, completeTask, occurrenceStored, pad, parseLocal, startOfDay, toStored } from './src/dates';
+import { askGemini } from './src/gemini';
 import { askClaude } from './src/claude';
 import {
   DEFAULT_ASSISTANT, clearChat, defaultPrefs, getApiKey, getAssistantName, getPrefs, getUserName,
@@ -18,7 +19,7 @@ import {
 import { ensurePermission, syncReminders } from './src/reminders';
 import { requestWidgetUpdate } from 'react-native-android-widget';
 import { renderAgendaWidget } from './src/widget/AgendaWidget';
-import { startVoice, stopVoice, voiceAvailable } from './src/voice';
+import { VOICE_LANGS, setVoiceLang, isInterruption, speak, speechAvailable, startVoice, stopSpeaking, stopVoice, voiceAvailable } from './src/voice';
 import {
   MAX_RECIPIENTS, applyResults, channelOf, openOverlaySettings, requestCallPermission, startRingtone, stopRingtone, typeOf, getCommsStatus, getSims, hasPhoneStatePermission, hasSmsPermission, nativeAvailable,
   normalizeNumber, openAppSettings, openBatterySettings, openExactAlarmSettings, placeCall, recipientsOf,
@@ -107,6 +108,7 @@ export default function Root() {
 function App() {
   const systemScheme = useColorScheme();
   const [prefs, setPrefsState] = useState(defaultPrefs);
+  useEffect(() => { setVoiceLang(prefs.voiceLang); }, [prefs.voiceLang]);
   const scheme = prefs.theme === 'system' ? (systemScheme === 'dark' ? 'dark' : 'light') : prefs.theme;
   const T = scheme === 'dark' ? dark : light;
   const s = useMemo(() => makeStyles(T), [scheme]);
@@ -115,7 +117,8 @@ function App() {
 
   const [tab, setTab] = useState('chat');
   const [data, setData] = useState({ tasks: [], notes: [], events: [] });
-  const [apiKey, setKey] = useState('');
+  const [keys, setKeys] = useState({ claude: '', gemini: '' });
+  const apiKey = keys[prefs.provider] || '';
   const [name, setName] = useState('');
   const [assistant, setAssistant] = useState(DEFAULT_ASSISTANT);
   const [ready, setReady] = useState(false);
@@ -129,8 +132,8 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      const [d, k, n, a, chat, p] = await Promise.all([loadData(), getApiKey(), getUserName(), getAssistantName(), loadChat(), getPrefs()]);
-      setData(d); setKey(k); setName(n); setAssistant(a); setPrefsState(p);
+      const [d, k, gk, n, a, chat, p] = await Promise.all([loadData(), getApiKey('claude'), getApiKey('gemini'), getUserName(), getAssistantName(), loadChat(), getPrefs()]);
+      setData(d); setKeys({ claude: k, gemini: gk }); setName(n); setAssistant(a); setPrefsState(p);
       if (chat?.display?.length) { setDisplay(chat.display); setHistory(chat.history || []); }
       setReady(true);
     })();
@@ -251,8 +254,9 @@ function App() {
     if (!isRetry) push('user', text);
     setBusy(true);
     try {
-      const out = await askClaude({
-        apiKey, userName: name, assistantName: assistant, data,
+      const ask = prefs.provider === 'gemini' ? askGemini : askClaude;
+      const out = await ask({
+        model: prefs.geminiModel, apiKey, userName: name, assistantName: assistant, data,
         messages: trimHistory([...history, { role: 'user', content: text }]),
       });
       setHistory(out.messages);
@@ -295,11 +299,11 @@ function App() {
         )}
         {tab === 'agenda' && <Agenda s={s} T={T} data={data} updateData={updateData} onBrief={() => setBriefTrigger((n) => n + 1)} intent={agendaIntent} onIntentHandled={() => setAgendaIntent(null)} onFakeCall={startFakeCall} />}
         {tab === 'settings' && (
-          <Settings s={s} T={T} {...{ apiKey, name, assistant, prefs, changePrefs }}
-            onSave={async (k, n, a) => {
+          <Settings s={s} T={T} {...{ keys, name, assistant, prefs, changePrefs }}
+            onSave={async (ks, n, a) => {
               const an = a || DEFAULT_ASSISTANT;
-              await Promise.all([setApiKey(k), setUserName(n), setAssistantName(an)]);
-              setKey(k); setName(n); setAssistant(an);
+              await Promise.all([setApiKey(ks.claude, 'claude'), setApiKey(ks.gemini, 'gemini'), setUserName(n), setAssistantName(an)]);
+              setKeys(ks); setName(n); setAssistant(an);
               setTab('chat');
             }} />
         )}
@@ -360,7 +364,116 @@ function Chat({ s, T, apiKey, name, assistant, display, busy, send, retry, goSet
   const listRef = useRef(null);
   const empty = display.length === 0;
 
-  useEffect(() => () => { if (voiceAvailable) stopVoice(); }, []);
+  // Hands-free conversation: listen -> send -> speak the reply -> listen again.
+  // The mic stays open while she talks, so talking over her interrupts her.
+  const [convo, setConvo] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const convoRef = useRef(false);
+  const speakingRef = useRef(false);
+  const modeRef = useRef('turn'); // 'barge' = mic open while she talks, 'turn' = capturing the user's sentence
+  const textRef = useRef('');
+  const spokenRef = useRef(null);
+  const spokenTextRef = useRef('');
+  const idleRef = useRef(null);
+  const sendRef = useRef(send);
+  sendRef.current = send;
+  const openMicRef = useRef(() => {});
+
+  const setSpk = (v) => { speakingRef.current = v; setSpeaking(v); };
+
+  const endConvo = () => {
+    convoRef.current = false;
+    clearTimeout(idleRef.current);
+    setConvo(false);
+    setListening(false);
+    setSpk(false);
+    stopSpeaking();
+    stopVoice();
+  };
+
+  openMicRef.current = async (mode) => {
+    if (!convoRef.current) return;
+    modeRef.current = mode;
+    const overlap = mode === 'barge';
+    if (!overlap) { textRef.current = ''; setVoiceErr(''); }
+    try {
+      setListening(true);
+      await startVoice({
+        continuous: overlap,
+        onText: (t) => {
+          if (modeRef.current === 'barge') {
+            if (!isInterruption(t, spokenTextRef.current)) return;
+            modeRef.current = 'turn';
+            stopSpeaking();
+            setSpk(false);
+          }
+          textRef.current = t;
+          setInput(t);
+          if (overlap) { // a continuous session doesn't end on silence by itself
+            clearTimeout(idleRef.current);
+            idleRef.current = setTimeout(stopVoice, 1500);
+          }
+        },
+        onEnd: () => {
+          setListening(false);
+          clearTimeout(idleRef.current);
+          if (!convoRef.current) return;
+          if (modeRef.current === 'barge') {
+            if (speakingRef.current) setTimeout(() => openMicRef.current('barge'), 250); // recogniser timed out: keep listening
+            return;
+          }
+          const v = textRef.current.trim();
+          if (v) { setInput(''); sendRef.current(v); } else endConvo();
+        },
+        onError: (m) => {
+          setListening(false);
+          if (modeRef.current === 'barge') {
+            if (convoRef.current && speakingRef.current) setTimeout(() => openMicRef.current('barge'), 800);
+            return;
+          }
+          setVoiceErr(m);
+          endConvo();
+        },
+      });
+    } catch (e) {
+      setVoiceErr(e.message);
+      endConvo();
+    }
+  };
+
+  // Gives the old recogniser a moment to close before starting the user's turn.
+  const turnSoon = () => setTimeout(() => openMicRef.current('turn'), 400);
+
+  const toggleConvo = () => {
+    if (convo) return endConvo();
+    if (!apiKey) return goSettings();
+    convoRef.current = true;
+    spokenRef.current = display.length ? display[display.length - 1].id : null;
+    setConvo(true);
+    openMicRef.current('turn');
+  };
+
+  useEffect(() => {
+    if (!convo || busy) return;
+    const last = display[display.length - 1];
+    if (!last || last.id === spokenRef.current) return;
+    spokenRef.current = last.id;
+    if (last.role === 'assistant') {
+      spokenTextRef.current = last.text;
+      setSpk(true);
+      speak(last.text, {
+        onDone: () => {
+          if (!speakingRef.current) return; // already interrupted
+          setSpk(false);
+          stopVoice();
+          turnSoon();
+        },
+      });
+      openMicRef.current('barge');
+    } else if (last.role === 'error') endConvo();
+  }, [display, busy, convo]);
+
+  useEffect(() => () => { convoRef.current = false; stopSpeaking(); if (voiceAvailable) stopVoice(); }, []);
   useEffect(() => {
     const sub = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () =>
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50));
@@ -392,11 +505,43 @@ function Chat({ s, T, apiKey, name, assistant, display, busy, send, retry, goSet
     if (ok === false && !apiKey) setInput(v);
   };
 
+  // Voice-only mode: no transcript or keyboard, just the assistant and its state.
+  if (convo) {
+    const state = speaking ? 'Speaking… talk to interrupt' : listening ? 'Listening…' : busy ? 'Thinking…' : '…';
+    return (
+      <View style={[s.flex, { alignItems: 'center', justifyContent: 'space-between', paddingVertical: 40 }]}>
+        <View style={{ alignItems: 'center', gap: 6 }}>
+          <Text style={{ color: T.text, fontSize: 22, fontWeight: '700' }}>{assistant}</Text>
+          <Text style={{ color: T.muted, fontSize: 14 }}>Voice conversation</Text>
+        </View>
+        <Pressable
+          disabled={!speaking}
+          onPress={() => { stopSpeaking(); setSpk(false); stopVoice(); turnSoon(); }}
+          style={[s.avatar, {
+            width: 170, height: 170, borderRadius: 85,
+            borderWidth: 4, borderColor: speaking ? T.primary : listening ? T.danger : T.border,
+          }]}
+        >
+          <Text style={[s.avatarText, { fontSize: 70 }]}>{(assistant[0] || 'J').toUpperCase()}</Text>
+        </Pressable>
+        <View style={{ alignItems: 'center', gap: 22 }}>
+          <Text style={{ color: speaking ? T.primary : listening ? T.danger : T.text, fontSize: 16, fontWeight: '600' }}>{state}</Text>
+          {voiceErr ? <Text style={{ color: T.danger, fontSize: 13, paddingHorizontal: 24, textAlign: 'center' }}>{voiceErr}</Text> : null}
+          <Pressable onPress={endConvo} accessibilityLabel="End voice conversation"
+            style={{ width: 68, height: 68, borderRadius: 34, backgroundColor: T.danger, alignItems: 'center', justifyContent: 'center' }}>
+            <Ionicons name="close" size={32} color="#fff" />
+          </Pressable>
+          <Text style={{ color: T.muted, fontSize: 12.5 }}>Tap to end and go back to the chat</Text>
+        </View>
+      </View>
+    );
+  }
+
   return (
     <View style={s.flex}>
       {!apiKey && (
         <Pressable onPress={goSettings} style={s.banner}>
-          <Text style={{ color: T.warn, flex: 1 }}>Add your Claude API key to get started</Text>
+          <Text style={{ color: T.warn, flex: 1 }}>Add your API key to get started</Text>
           <Text style={{ color: T.warn, fontWeight: '700' }}>Set up →</Text>
         </Pressable>
       )}
@@ -430,9 +575,17 @@ function Chat({ s, T, apiKey, name, assistant, display, busy, send, retry, goSet
       <View style={s.inputRow}>
         <TextInput
           style={s.input} value={input} onChangeText={setInput}
-          placeholder={listening ? 'Listening…' : `Message ${assistant}…`}
+          placeholder={listening ? 'Listening…' : convo ? `${assistant} is talking…` : `Message ${assistant}…`}
           placeholderTextColor={listening ? T.danger : T.muted} multiline
         />
+        {voiceAvailable && speechAvailable && (
+          <Pressable
+            style={[s.micBtn, convo && { backgroundColor: T.primary, borderColor: T.primary }]}
+            onPress={toggleConvo} accessibilityLabel={convo ? 'End voice conversation' : 'Talk with voice'}
+          >
+            <Ionicons name={convo ? 'headset' : 'headset-outline'} size={22} color={convo ? T.onPrimary : T.text} />
+          </Pressable>
+        )}
         {voiceAvailable && (
           <Pressable
             style={[s.micBtn, listening && { backgroundColor: T.danger, borderColor: T.danger }]}
@@ -639,6 +792,15 @@ function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFa
             if (nativeAvailable && patch.type === 'call') {
               if (!(await requestCallPermission())) {
                 Alert.alert('Call permission denied', 'The call is saved, but it cannot be placed until you allow Phone access in app settings.');
+              } else {
+                const st = await getCommsStatus();
+                if (st && !st.overlay) {
+                  Alert.alert(
+                    'Allow calls to start by themselves',
+                    "Android needs 'Display over other apps' for myPA to place a call while the app is closed. Turn it on for myPA on the next screen, then come back.",
+                    [{ text: 'Later', style: 'cancel' }, { text: 'Open settings', onPress: openOverlaySettings }],
+                  );
+                }
               }
             } else if (nativeAvailable && patch.channel !== 'whatsapp' && !(await hasSmsPermission())) {
               const ok = await requestSmsPermission();
@@ -1211,8 +1373,11 @@ const Empty = ({ s, icon, text }) => (
 );
 
 // ---------- settings ----------
-function Settings({ s, T, apiKey, name, assistant, prefs, changePrefs, onSave }) {
-  const [k, setK] = useState(apiKey);
+function Settings({ s, T, keys, name, assistant, prefs, changePrefs, onSave }) {
+  const [ks, setKs] = useState(keys);
+  const provider = prefs.provider || 'claude';
+  const k = ks[provider] || '';
+  const setK = (v) => setKs((x) => ({ ...x, [provider]: v }));
   const [n, setN] = useState(name);
   const [a, setA] = useState(assistant);
   const [show, setShow] = useState(false);
@@ -1258,22 +1423,47 @@ function Settings({ s, T, apiKey, name, assistant, prefs, changePrefs, onSave })
             <TimeField s={s} T={T} value={prefs.briefingTime} onChange={(v) => changePrefs({ briefingTime: v })} />
           </View>
         )}
-        <Text style={[s.muted, { marginTop: 10 }]}>
-          Voice input: {voiceAvailable ? 'enabled (mic button in chat).' : 'needs a development build. In Expo Go, use the microphone on your keyboard.'}
+        <Text style={[s.label, { marginTop: 14 }]}>Voice input language</Text>
+        <View style={[s.seg, { marginBottom: 4 }]}>
+          {VOICE_LANGS.map(([v, l]) => (
+            <Pressable key={v} style={[s.segItem, prefs.voiceLang === v && s.segActive]} onPress={() => changePrefs({ voiceLang: v })}>
+              <Text style={[s.segText, prefs.voiceLang === v && { color: T.onPrimary, fontWeight: '700' }]} numberOfLines={1}>{l}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <Text style={[s.muted, { marginTop: 6 }]}>
+          Swahili needs the Swahili voice pack in your phone's Google speech settings. Jolly always answers in the language you write in.{' '}Voice input: {voiceAvailable ? 'enabled (mic button in chat).' : 'needs a development build. In Expo Go, use the microphone on your keyboard.'}
         </Text>
       </View>
 
       <View style={s.panel}>
-        <Text style={s.label}>Claude API key</Text>
+        <Text style={s.label}>AI provider</Text>
+        <View style={[s.seg, { marginBottom: 14 }]}>
+          {[['claude', 'Claude'], ['gemini', 'Gemini']].map(([v, l]) => (
+            <Pressable key={v} style={[s.segItem, provider === v && s.segActive]} onPress={() => changePrefs({ provider: v })}>
+              <Text style={[s.segText, provider === v && { color: T.onPrimary, fontWeight: '700' }]}>{l}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <Text style={s.label}>{provider === 'gemini' ? 'Gemini API key' : 'Claude API key'}</Text>
         <View style={s.keyRow}>
-          <TextInput style={[s.field, s.flex1, { marginBottom: 0 }]} value={k} onChangeText={setK} placeholder="sk-ant-…"
+          <TextInput style={[s.field, s.flex1, { marginBottom: 0 }]} value={k} onChangeText={setK} placeholder={provider === 'gemini' ? 'AIza…' : 'sk-ant-…'}
             placeholderTextColor={T.muted} secureTextEntry={!show} autoCapitalize="none" autoCorrect={false} />
           <Pressable onPress={() => setShow(!show)} style={s.showBtn}><Text style={{ color: T.primary, fontWeight: '600' }}>{show ? 'Hide' : 'Show'}</Text></Pressable>
         </View>
-        <Text style={[s.muted, { marginTop: 8 }]}>Stored encrypted on this device only. Create one at console.anthropic.com.</Text>
+        {provider === 'gemini' && (
+          <>
+            <Text style={[s.label, { marginTop: 14 }]}>Gemini model</Text>
+            <TextInput style={s.field} value={prefs.geminiModel} onChangeText={(v) => changePrefs({ geminiModel: v.trim() })}
+              placeholder="gemini-flash-latest" placeholderTextColor={T.muted} autoCapitalize="none" autoCorrect={false} />
+          </>
+        )}
+        <Text style={[s.muted, { marginTop: 8 }]}>
+          Stored encrypted on this device only. {provider === 'gemini' ? 'Create a key at aistudio.google.com/apikey. If you see a model error, enter a model name from that site.' : 'Create one at console.anthropic.com.'} You can switch any time; your chat carries over.
+        </Text>
       </View>
 
-      <Pressable style={[s.primaryBtn, !k.trim() && { opacity: 0.5 }]} disabled={!k.trim()} onPress={() => onSave(k.trim(), n.trim(), a.trim())}>
+      <Pressable style={[s.primaryBtn, !k.trim() && { opacity: 0.5 }]} disabled={!k.trim()} onPress={() => onSave({ claude: (ks.claude || '').trim(), gemini: (ks.gemini || '').trim() }, n.trim(), a.trim())}>
         <Text style={{ color: T.onPrimary, fontWeight: '700', fontSize: 16 }}>Save</Text>
       </Pressable>
     </ScrollView>

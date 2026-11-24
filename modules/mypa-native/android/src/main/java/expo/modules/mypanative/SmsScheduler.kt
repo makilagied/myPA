@@ -206,7 +206,10 @@ object SmsScheduler {
     val hasCallPerm = ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
     val canStart = hasCallPerm && Settings.canDrawOverlays(ctx)
     try {
-      if (canStart) {
+      // TelecomManager.placeCall goes through the system and is not blocked by the background-start rules.
+      if (hasCallPerm && placeViaTelecom(ctx, job)) {
+        addResult(ctx, job.id, "sent", null)
+      } else if (canStart) {
         ctx.startActivity(callIntent(ctx, job.number, job.subId))
         addResult(ctx, job.id, "sent", null)
       } else {
@@ -219,6 +222,19 @@ object SmsScheduler {
       addResult(ctx, job.id, "failed", e.message ?: e.javaClass.simpleName)
     }
     advance(ctx, job)
+  }
+
+  @android.annotation.SuppressLint("MissingPermission")
+  private fun placeViaTelecom(ctx: Context, job: SmsJob): Boolean {
+    return try {
+      val tm = ctx.getSystemService(Context.TELECOM_SERVICE) as android.telecom.TelecomManager
+      val extras = android.os.Bundle()
+      if (job.subId >= 0) phoneAccountFor(ctx, job.subId)?.let { extras.putParcelable(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
+      tm.placeCall(Uri.fromParts("tel", job.number.trim(), null), extras)
+      true
+    } catch (_: Exception) {
+      false
+    }
   }
 
   /** ACTION_CALL that dials from the chosen SIM (subId < 0 = the phone's default calling SIM). */

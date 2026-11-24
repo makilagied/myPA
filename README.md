@@ -14,7 +14,7 @@ Most of the app works **without AI or any API**. Claude chat is optional.
 - **Fake call**: a realistic incoming-call screen on your own phone, with your ringtone. It never calls anyone.
 - **Home-screen widget**: today's agenda, with a shortcut to add a task.
 - **Voice input** and **dark mode**.
-- **Chat with Jolly** (optional): needs your own Claude API key, entered in Settings. It is stored on the device.
+- **Chat with Jolly** (optional): choose Claude or Gemini in Settings and enter your own API key for it. Keys are stored encrypted on the device, and you can switch provider at any time.
 
 Sent-text notifications never show the number or message.
 
