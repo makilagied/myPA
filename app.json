@@ -63,6 +63,12 @@
             }
           ]
         }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "myPA reads your calendar so your assistant knows your schedule and can warn you about clashes."
+        }
       ]
     ],
     "extra": {

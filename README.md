@@ -6,6 +6,7 @@ Most of the app works **without AI or any API**. Claude chat is optional.
 
 ## Features
 
+- **Executive-assistant tools**: a **Chase** list for what others owe you (with a one-tap nudge by SMS or WhatsApp and a chase reminder), **People** cards with notes and check-in reminders, meeting prep and wrap-up, task priorities and delegation (optionally auto-texting the owner for an update), clash and free-slot detection, an optional read-only link to your phone calendar, a richer morning briefing and an evening wrap-up. Jolly can draft messages for you to review and send.
 - **Agenda**: tasks, events and a notebook. Everything can be added and edited by hand, with date/time pickers and daily/weekly/monthly repeats.
 - **Reminders**: local notifications for tasks and events, plus an optional daily morning briefing.
 - **Scheduled texts**: SMS sent by a native alarm at the set time, even when the app is closed. Supports several recipients (up to 25), SIM choice and repeats.
@@ -38,7 +39,7 @@ The build page gives an install link and QR code. Uninstall any older build firs
 
 ## Making scheduled texts and calls reliable
 
-After installing, open the **Contact** tab and finish the setup card:
+After installing, open the **Messages** tab and finish the setup card:
 
 1. Allow **SMS** (and **Phone** for calls and SIM choice).
 2. Allow **exact alarms**.

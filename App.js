@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, FlatList, Vibration, Keyboard, LayoutAnimation, Platform, Pressable, ScrollView,
+  ActivityIndicator, Alert, AppState, FlatList, Share, Vibration, Keyboard, LayoutAnimation, Platform, Pressable, ScrollView,
   StyleSheet, Switch, Text, TextInput, View, useColorScheme, useWindowDimensions,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -9,7 +9,8 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 import { Linking, Modal } from 'react-native';
 import DateTimePicker, { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 import * as Notifications from 'expo-notifications';
-import { REPEATS, REPEAT_LABEL, completeTask, occurrenceStored, pad, parseLocal, startOfDay, toStored } from './src/dates';
+import { REPEATS, REPEAT_LABEL, completeTask, findClashes, occurrenceStored, pad, parseLocal, reachOutDue, startOfDay, toStored } from './src/dates';
+import { calendarAvailable, clearCalendarCache, refreshCalendar, requestCalendarPermission } from './src/calendar';
 import { askGemini } from './src/gemini';
 import { askClaude } from './src/claude';
 import {
@@ -39,7 +40,8 @@ const dark = {
   danger: '#F87171', dangerSoft: '#3A1D1D', warnSoft: '#3A2F14', warn: '#FCD34D', success: '#4ADE80',
 };
 
-const BRIEF_PROMPT = 'Give me my morning briefing: what is on my calendar and task list today, anything overdue, and what I should prioritise.';
+const BRIEF_PROMPT = "Give me my morning briefing: today's meetings (flag any clashes), tasks due and overdue, what I'm waiting on that needs chasing, people I should check in with, and what I should prioritise.";
+const WRAP_PROMPT = "Give me my evening wrap-up: what is still open from today, who I should chase tomorrow, and a preview of tomorrow's meetings.";
 
 const SUGGESTIONS = [
   '☀️ Give me my morning briefing',
@@ -116,7 +118,10 @@ function App() {
   const kb = useKeyboardHeight();
 
   const [tab, setTab] = useState('chat');
-  const [data, setData] = useState({ tasks: [], notes: [], events: [] });
+  const [data, setData] = useState({ tasks: [], notes: [], events: [], waiting: [], people: [] });
+  const [devEvents, setDevEvents] = useState([]);
+  const [calTick, setCalTick] = useState(0);
+  const speakNext = useRef(false);
   const [keys, setKeys] = useState({ claude: '', gemini: '' });
   const apiKey = keys[prefs.provider] || '';
   const [name, setName] = useState('');
@@ -126,6 +131,7 @@ function App() {
   const [display, setDisplay] = useState([]);
   const [busy, setBusy] = useState(false);
   const [briefTrigger, setBriefTrigger] = useState(0);
+  const [wrapTrigger, setWrapTrigger] = useState(0);
   const [agendaIntent, setAgendaIntent] = useState(null);
   const [fake, setFake] = useState(null); // { name } while the fake call screen is up
   const fakeTimer = useRef(null);
@@ -145,13 +151,36 @@ function App() {
 
   useEffect(() => {
     if (ready) syncReminders(data, prefs);
-  }, [data, prefs.reminders, prefs.briefing, prefs.briefingTime, ready]);
+  }, [data, prefs.reminders, prefs.briefing, prefs.briefingTime, prefs.wrapup, prefs.wrapupTime, calTick, ready]);
+
+  // Phone calendar: reload when enabled and whenever the app comes back to the front.
+  useEffect(() => {
+    if (!ready) return;
+    const load = async () => {
+      if (!prefs.calendar) { clearCalendarCache(); setDevEvents([]); return setCalTick((n) => n + 1); }
+      setDevEvents(await refreshCalendar());
+      setCalTick((n) => n + 1);
+    };
+    load();
+    const sub = AppState.addEventListener('change', (a) => a === 'active' && load());
+    return () => sub.remove();
+  }, [ready, prefs.calendar]);
+
+  const toggleCalendar = async (on) => {
+    if (on) {
+      if (!calendarAvailable) return Alert.alert('Needs a new build', 'Calendar access is not in this version of the app. Install the latest build.');
+      if (!(await requestCalendarPermission())) {
+        return Alert.alert('Calendar permission denied', 'Allow Calendar access for myPA in app settings to see your phone calendar here.');
+      }
+    }
+    changePrefs({ calendar: on });
+  };
 
   const changePrefs = async (patch) => {
     const next = { ...prefs, ...patch };
     setPrefsState(next);
     await setPrefs(next);
-    if (patch.reminders || patch.briefing) await ensurePermission();
+    if (patch.reminders || patch.briefing || patch.wrapup) await ensurePermission();
   };
 
   useEffect(() => {
@@ -159,6 +188,8 @@ function App() {
       const sub = Notifications.addNotificationResponseReceivedListener((r) => {
         const d = r.notification.request.content.data || {};
         if (d.type === 'briefing') setBriefTrigger((n) => n + 1);
+        else if (d.type === 'wrapup') setWrapTrigger((n) => n + 1);
+        else if (d.type === 'waiting' || d.type === 'person') { setTab('people'); setAgendaIntent({ seg: d.type === 'waiting' ? 'waiting' : 'people', n: Date.now() }); }
         else if (d.type === 'whatsapp' && d.url) Linking.openURL(d.url).catch(() => {});
         else if (d.type === 'fakecall') { clearTimeout(fakeTimer.current); setFake({ name: d.name || 'Unknown' }); }
       });
@@ -167,8 +198,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (briefTrigger > 0 && ready && !busy) { setTab('chat'); send(BRIEF_PROMPT); }
+    if (briefTrigger > 0 && ready && !busy) { setTab('chat'); speakNext.current = true; send(BRIEF_PROMPT); }
   }, [briefTrigger]);
+
+  useEffect(() => {
+    if (wrapTrigger > 0 && ready && !busy) { setTab('chat'); speakNext.current = true; send(WRAP_PROMPT); }
+  }, [wrapTrigger]);
 
   const dataRef = useRef(data);
   dataRef.current = data;
@@ -210,7 +245,7 @@ function App() {
       if (url && url.startsWith('mypa://add/')) {
         const kind = url.replace('mypa://add/', '').replace(/\/$/, '');
         if (['task', 'event', 'note', 'text'].includes(kind)) {
-          setTab('agenda');
+          setTab(kind === 'text' ? 'comms' : 'agenda');
           setAgendaIntent({ kind, n: Date.now() });
         }
       }
@@ -261,7 +296,11 @@ function App() {
       });
       setHistory(out.messages);
       if (out.data !== data) updateData(out.data);
-      push('assistant', out.reply || 'Done.');
+      push('assistant', out.reply || 'Done.', out.drafts && out.drafts.length ? { drafts: out.drafts } : undefined);
+      if (speakNext.current) {
+        speakNext.current = false;
+        if (prefs.speakBriefing && speechAvailable && out.reply) speak(out.reply);
+      }
     } catch (e) {
       push('error', e.message, { retry: text });
     } finally {
@@ -269,6 +308,8 @@ function App() {
     }
     return true;
   };
+
+  const askJolly = (text) => { setTab('chat'); send(text); };
 
   const retry = (msg) => {
     setDisplay((d) => d.filter((m) => m.id !== msg.id));
@@ -284,6 +325,10 @@ function App() {
   if (!ready) return <View style={[s.flex, s.center]}><ActivityIndicator color={T.primary} /></View>;
 
   const openTasks = data.tasks.filter((t) => !t.done).length;
+  const todayStr = localDay();
+  const peopleBadge =
+    (data.waiting || []).filter((w) => !w.done && w.due && w.due.slice(0, 10) <= todayStr).length +
+    (data.people || []).filter((p) => { const d = reachOutDue(p); return d && d <= new Date(); }).length;
   const selectTab = (k) => {
     LayoutAnimation.configureNext(LayoutAnimation.create(180, 'easeInEaseOut', 'opacity'));
     setTab(k);
@@ -297,9 +342,12 @@ function App() {
         {tab === 'chat' && (
           <Chat s={s} T={T} {...{ apiKey, name, assistant, display, busy, send, retry }} goSettings={() => setTab('settings')} />
         )}
-        {tab === 'agenda' && <Agenda s={s} T={T} data={data} updateData={updateData} onBrief={() => setBriefTrigger((n) => n + 1)} intent={agendaIntent} onIntentHandled={() => setAgendaIntent(null)} onFakeCall={startFakeCall} />}
+        {['agenda', 'people', 'comms'].includes(tab) && (
+          <Agenda key={tab} mode={tab} s={s} T={T} data={data} updateData={updateData} onBrief={() => setBriefTrigger((n) => n + 1)} intent={agendaIntent}
+            onIntentHandled={() => setAgendaIntent(null)} onFakeCall={startFakeCall} devEvents={devEvents} onAsk={askJolly} />
+        )}
         {tab === 'settings' && (
-          <Settings s={s} T={T} {...{ keys, name, assistant, prefs, changePrefs }}
+          <Settings s={s} T={T} {...{ keys, name, assistant, prefs, changePrefs, toggleCalendar }}
             onSave={async (ks, n, a) => {
               const an = a || DEFAULT_ASSISTANT;
               await Promise.all([setApiKey(ks.claude, 'claude'), setApiKey(ks.gemini, 'gemini'), setUserName(n), setAssistantName(an)]);
@@ -314,7 +362,9 @@ function App() {
           <View style={s.navBar}>
             {[
               ['agenda', 'calendar', 'Agenda', openTasks],
+              ['people', 'people', 'People', peopleBadge],
               ['chat', 'chatbubble-ellipses', 'Chat'],
+              ['comms', 'paper-plane', 'Messages'],
               ['settings', 'settings', 'Settings'],
             ].map(([k, icon, label, badge]) => {
               const active = tab === k;
@@ -615,6 +665,7 @@ function Bubble({ s, T, item, retry }) {
         <Text selectable style={{ color: mine ? T.onPrimary : err ? T.danger : T.text, fontSize: 15.5, lineHeight: 21 }}>
           {item.text}
         </Text>
+        {item.drafts && item.drafts.length ? <DraftCards s={s} T={T} drafts={item.drafts} /> : null}
         {err && item.retry ? (
           <Pressable onPress={() => retry(item)} style={{ marginTop: 6 }}>
             <Text style={{ color: T.danger, fontWeight: '700' }}>Tap to retry</Text>
@@ -637,54 +688,119 @@ function TypingDots({ s, T }) {
 }
 
 // ---------- agenda ----------
-function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFakeCall }) {
-  const [seg, setSeg] = useState('tasks');
+const PAGE_SEGS = {
+  agenda: [['tasks', 'Tasks'], ['events', 'Events'], ['notes', 'Notes']],
+  people: [['waiting', 'To chase'], ['people', 'People']],
+  comms: [['contact', 'Texts & calls']],
+};
+
+function Agenda({ mode = 'agenda', s, T, data, updateData, onBrief, intent, onIntentHandled, onFakeCall, devEvents = [], onAsk }) {
+  const [seg, setSeg] = useState(PAGE_SEGS[mode][0][0]);
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState(null); // { kind, item, isNew }
   const today = localDay();
 
   useEffect(() => {
     if (!intent) return;
-    setSeg({ task: 'tasks', event: 'events', note: 'notes', text: 'contact' }[intent.kind]);
+    if (intent.seg) { setSeg(intent.seg); setEditing(null); onIntentHandled?.(); return; }
+    setSeg({ task: 'tasks', event: 'events', note: 'notes', text: 'contact' }[intent.kind] || PAGE_SEGS[mode][0][0]);
     setEditing({ kind: intent.kind, item: {}, isNew: true });
     onIntentHandled?.();
   }, [intent?.n]);
 
-  const KEYS = { task: 'tasks', event: 'events', note: 'notes', text: 'texts' };
-  const SEG_KIND = { tasks: 'task', events: 'event', notes: 'note', contact: 'text' };
+  const KEYS = { task: 'tasks', event: 'events', note: 'notes', text: 'texts', waiting: 'waiting', person: 'people' };
+  const SEG_KIND = { tasks: 'task', events: 'event', notes: 'note', contact: 'text', waiting: 'waiting', people: 'person' };
+
+  // A delegated task can text its owner for an update the day before it is due.
+  const withDelegation = (d, task) => {
+    let texts = (d.texts || []).filter((t) => t.taskId !== task.id);
+    const num = task.assignee && task.assignee.number;
+    if (task.autoAsk && num && task.due && !task.done) {
+      const due = parseLocal(task.due);
+      let at = new Date(due.getTime() - 86400000);
+      at.setHours(9, 0, 0, 0);
+      if (at.getTime() < Date.now() + 120000) at = new Date(due.getTime() - 3600000);
+      if (at.getTime() >= Date.now() + 120000) {
+        texts = [...texts, {
+          id: newId(), taskId: task.id, type: 'text', channel: 'sms', sim: null, repeat: 'none', status: 'scheduled',
+          recipients: [{ name: task.assignee.name, number: num }], name: task.assignee.name, number: num,
+          message: `Hi ${firstName(task.assignee.name)}, quick check on "${task.title}" - how is it going?`,
+          at: toStored(at, true), created: new Date().toISOString(),
+        }];
+      }
+    }
+    return { ...d, texts };
+  };
 
   const saveEdit = (patch) => {
     const { kind, item, isNew } = editing;
     const key = KEYS[kind];
     const now = new Date().toISOString();
+    const id = isNew ? newId() : item.id;
+    let next;
     if (isNew) {
-      const base = { id: newId(), created: now, ...(kind === 'task' ? { done: false } : {}), ...(kind === 'note' ? { updated: now } : {}), ...(kind === 'text' ? { status: 'scheduled' } : {}) };
-      updateData({ ...data, [key]: [...(data[key] || []), { ...base, ...patch }] });
+      const base = {
+        id, created: now,
+        ...(kind === 'task' ? { done: false } : {}),
+        ...(kind === 'note' ? { updated: now } : {}),
+        ...(kind === 'text' ? { status: 'scheduled' } : {}),
+        ...(kind === 'waiting' ? { done: false } : {}),
+        ...(kind === 'person' ? { last: null } : {}),
+      };
+      next = { ...data, [key]: [...(data[key] || []), { ...base, ...patch }] };
     } else {
       const extra = kind === 'note' ? { updated: now } : kind === 'text' ? { status: 'scheduled', error: null, doneAt: null } : {};
-      updateData({ ...data, [key]: data[key].map((x) => (x.id === item.id ? { ...x, ...patch, ...extra } : x)) });
+      next = { ...data, [key]: (data[key] || []).map((x) => (x.id === item.id ? { ...x, ...patch, ...extra } : x)) };
     }
+    if (kind === 'task') next = withDelegation(next, next.tasks.find((t) => t.id === id));
+    updateData(next);
     setEditing(null);
   };
 
-  const tasks = [...data.tasks].sort((a, b) => (a.done - b.done) || (a.due || '9').localeCompare(b.due || '9'));
+  const tasks = [...data.tasks].sort((a, b) => (a.done - b.done) || ((b.priority === 'high') - (a.priority === 'high')) || (a.due || '9').localeCompare(b.due || '9'));
   const sod = startOfDay();
-  const events = data.events
-    .map((e) => ({ ...e, eff: occurrenceStored(e.start, e.repeat, sod) }))
-    .sort((a, b) => a.eff.localeCompare(b.eff));
+  const events = [
+    ...data.events.map((e) => ({ ...e, eff: occurrenceStored(e.start, e.repeat, sod) })),
+    ...devEvents.map((e) => ({ ...e, eff: e.start, readonly: true })),
+  ].sort((a, b) => a.eff.localeCompare(b.eff));
   const todayEvents = events.filter((e) => e.eff.slice(0, 10) === today).length;
   const upcoming = events.filter((e) => e.eff.slice(0, 10) >= today);
   const past = events.filter((e) => e.eff.slice(0, 10) < today);
+  const clash = {};
+  for (const c of findClashes(upcoming.map((e) => {
+    const st = parseLocal(e.eff);
+    return { id: e.id, title: e.title, start: st, end: (e.end && parseLocal(e.end)) || new Date(st.getTime() + 3600000), allDay: !e.eff.includes('T') };
+  }))) {
+    if (c.kind === 'overlap') { clash[c.a.id] = clash[c.a.id] || c.b.title; clash[c.b.id] = clash[c.b.id] || c.a.title; }
+  }
+  const clashesToday = upcoming.filter((e) => clash[e.id] && e.eff.slice(0, 10) === today).length;
   const open = data.tasks.filter((t) => !t.done).length;
+  const overdueCount = data.tasks.filter((t) => !t.done && t.due && t.due.slice(0, 10) < today).length;
+  const chaseNow = (data.waiting || []).filter((w) => !w.done && w.due && w.due.slice(0, 10) <= today).length;
+  const checkinsDue = (data.people || []).filter((p) => { const d = reachOutDue(p); return d && d <= new Date(); }).length;
 
   const q = query.trim().toLowerCase();
   const notes = data.notes
     .filter((n) => !q || (n.title || '').toLowerCase().includes(q) || (n.text || '').toLowerCase().includes(q))
     .sort((a, b) => (!!b.pinned - !!a.pinned) || (b.updated || b.created || '').localeCompare(a.updated || a.created || ''));
 
-  const remove = (key, id) => updateData({ ...data, [key]: data[key].filter((x) => x.id !== id) });
-  const toggle = (id) =>
-    updateData({ ...data, tasks: data.tasks.map((t) => (t.id !== id ? t : t.done ? { ...t, done: false } : completeTask(t))) });
+  const remove = (key, id) => updateData({
+    ...data,
+    [key]: data[key].filter((x) => x.id !== id),
+    ...(key === 'tasks' ? { texts: (data.texts || []).filter((t) => t.taskId !== id) } : {}),
+  });
+  const toggle = (id) => {
+    const t = data.tasks.find((x) => x.id === id);
+    const finishing = t && !t.done && completeTask(t).done;
+    updateData({
+      ...data,
+      tasks: data.tasks.map((x) => (x.id !== id ? x : x.done ? { ...x, done: false } : completeTask(x))),
+      // finished tasks no longer need their automatic "how is it going?" text
+      ...(finishing ? { texts: (data.texts || []).filter((x) => x.taskId !== id) } : {}),
+    });
+  };
+  const setWaitingDone = (id) => updateData({ ...data, waiting: (data.waiting || []).map((w) => (w.id === id ? { ...w, done: true } : w)) });
+  const markContacted = (id) => updateData({ ...data, people: (data.people || []).map((p) => (p.id === id ? { ...p, last: localDay() } : p)) });
   const pin = (id) => updateData({ ...data, notes: data.notes.map((n) => (n.id === id ? { ...n, pinned: !n.pinned } : n)) });
 
   const Del = ({ onPress }) => (
@@ -692,35 +808,59 @@ function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFa
   );
 
   const EventCard = ({ e, dim }) => (
-    <Pressable style={[s.card, dim && { opacity: 0.55 }]} onPress={() => setEditing({ kind: 'event', item: e })}>
+    <Pressable style={[s.card, dim && { opacity: 0.55 }, { alignItems: 'flex-start' }]} onPress={() => !e.readonly && setEditing({ kind: 'event', item: e })}>
       <View style={s.flex1}>
-        <Text style={s.cardTitle}>{e.title}</Text>
+        <Text style={s.cardTitle}>{e.readonly ? '📅 ' : ''}{e.title}</Text>
         <Text style={s.muted}>{fmt(e.eff)}{e.repeat && e.repeat !== 'none' ? ' · ↻ ' + REPEAT_LABEL[e.repeat] : ''}{e.location ? ' · 📍 ' + e.location : ''}</Text>
+        {e.attendees ? <Text style={s.muted}>👥 {e.attendees}</Text> : null}
+        {clash[e.id] && !dim ? <Text style={{ color: T.danger, fontSize: 12.5, fontWeight: '700', marginTop: 3 }}>⚠ Clashes with {clash[e.id]}</Text> : null}
+        {e.readonly ? <Text style={[s.muted, { fontSize: 11 }]}>From your phone calendar</Text> : null}
+        {!dim && !e.readonly && onAsk ? (
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+            <MiniBtn s={s} T={T} icon="sparkles-outline" label="Prep me" onPress={() =>
+              onAsk(`Prep me for my event "${e.title}" (id ${e.id}) on ${fmt(e.eff)}. Check who is attending against my saved people, anything I'm waiting on from them, and give me a short brief with suggested questions.`)} />
+            <MiniBtn s={s} T={T} icon="create-outline" label="Wrap up" onPress={() =>
+              onAsk(`Wrap up my event "${e.title}" (id ${e.id}). Ask me what was decided, then save it as meeting notes on the event, add tasks for what I must do, and add follow-ups for what others owe me.`)} />
+          </View>
+        ) : null}
       </View>
-      <Del onPress={() => remove('events', e.id)} />
+      {!e.readonly ? <Del onPress={() => remove('events', e.id)} /> : null}
     </Pressable>
   );
 
   return (
     <View style={s.flex}>
       <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }} keyboardShouldPersistTaps="handled">
-        <View style={s.stats}>
-          <View style={s.stat}><Text style={s.statNum}>{todayEvents}</Text><Text style={s.muted}>events today</Text></View>
-          <View style={s.stat}><Text style={s.statNum}>{open}</Text><Text style={s.muted}>open tasks</Text></View>
-          <View style={s.stat}><Text style={s.statNum}>{data.notes.length}</Text><Text style={s.muted}>notes</Text></View>
-        </View>
-
-        <Pressable style={s.briefBtn} onPress={onBrief}>
-          <Text style={{ color: T.primary, fontWeight: '700' }}>☀️ Brief me on today</Text>
-        </Pressable>
-
-        <View style={s.seg}>
-          {[['tasks', 'Tasks'], ['events', 'Events'], ['notes', 'Notes'], ['contact', 'Contact']].map(([k, l]) => (
-            <Pressable key={k} style={[s.segItem, seg === k && s.segActive]} onPress={() => setSeg(k)}>
-              <Text style={[s.segText, seg === k && { color: T.onPrimary, fontWeight: '700' }]}>{l}</Text>
+        {mode === 'agenda' && (
+          <>
+            <View style={s.stats}>
+              <View style={s.stat}><Text style={s.statNum}>{todayEvents}</Text><Text style={s.muted}>{clashesToday ? `today · ${clashesToday} clash${clashesToday > 1 ? 'es' : ''}` : 'events today'}</Text></View>
+              <View style={s.stat}><Text style={s.statNum}>{open}</Text><Text style={s.muted}>open tasks</Text></View>
+              <View style={s.stat}><Text style={[s.statNum, overdueCount > 0 && { color: T.danger }]}>{overdueCount}</Text><Text style={s.muted}>overdue</Text></View>
+            </View>
+            <Pressable style={s.briefBtn} onPress={onBrief}>
+              <Text style={{ color: T.primary, fontWeight: '700' }}>☀️ Brief me on today</Text>
             </Pressable>
-          ))}
-        </View>
+          </>
+        )}
+
+        {mode === 'people' && (
+          <View style={s.stats}>
+            <View style={s.stat}><Text style={s.statNum}>{(data.waiting || []).filter((w) => !w.done).length}</Text><Text style={s.muted}>waiting on</Text></View>
+            <View style={s.stat}><Text style={[s.statNum, chaseNow > 0 && { color: T.danger }]}>{chaseNow}</Text><Text style={s.muted}>to chase now</Text></View>
+            <View style={s.stat}><Text style={[s.statNum, checkinsDue > 0 && { color: T.danger }]}>{checkinsDue}</Text><Text style={s.muted}>check-ins due</Text></View>
+          </View>
+        )}
+
+        {PAGE_SEGS[mode].length > 1 && (
+          <View style={s.seg}>
+            {PAGE_SEGS[mode].map(([k, l]) => (
+              <Pressable key={k} style={[s.segItem, seg === k && s.segActive]} onPress={() => setSeg(k)}>
+                <Text style={[s.segText, seg === k && { color: T.onPrimary, fontWeight: '700' }]}>{l}</Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
 
         {seg === 'notes' && (
           <View style={s.addRow}>
@@ -741,7 +881,17 @@ function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFa
                   </View>
                 </Pressable>
                 <View style={s.flex1}>
-                  <Text style={[s.cardTitle, t.done && { textDecorationLine: 'line-through', color: T.muted }]}>{t.title}</Text>
+                  <Text style={[s.cardTitle, t.done && { textDecorationLine: 'line-through', color: T.muted }]}>{t.priority === 'high' && !t.done ? '🔴 ' : ''}{t.title}</Text>
+                  {t.assignee && t.assignee.name ? (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 }}>
+                      <Text style={s.muted}>→ {t.assignee.name}{t.autoAsk ? ' · auto-asks for update' : ''}</Text>
+                      {!t.done && t.assignee.number ? (
+                        <Pressable hitSlop={8} onPress={() => askChannel({ name: t.assignee.name, number: t.assignee.number, text: `Hi ${firstName(t.assignee.name)}, quick check on "${t.title}" - how is it going?` })}>
+                          <Text style={{ color: T.primary, fontWeight: '700', fontSize: 12.5 }}>Ask for update</Text>
+                        </Pressable>
+                      ) : null}
+                    </View>
+                  ) : null}
                   {t.due ? <Text style={[s.muted, overdue && { color: T.danger, fontWeight: '700' }]}>{overdue ? 'Overdue · ' : 'Due '}{fmt(t.due)}{t.repeat && t.repeat !== 'none' ? ' · ↻ ' + REPEAT_LABEL[t.repeat] : ''}</Text> : null}
                 </View>
                 <Del onPress={() => remove('tasks', t.id)} />
@@ -776,6 +926,14 @@ function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFa
             </Pressable>
           ))
         )}
+        {seg === 'waiting' && (
+          <WaitingPanel s={s} T={T} list={data.waiting || []} onEdit={(w) => setEditing({ kind: 'waiting', item: w })}
+            onResolve={setWaitingDone} onDelete={(id) => remove('waiting', id)} />
+        )}
+        {seg === 'people' && (
+          <PeoplePanel s={s} T={T} list={data.people || []} onEdit={(p) => setEditing({ kind: 'person', item: p })}
+            onContacted={markContacted} onDelete={(id) => remove('people', id)} />
+        )}
         {seg === 'contact' && (
           <ContactPanel s={s} T={T} texts={data.texts || []} onEdit={(t) => setEditing({ kind: 'text', item: t })}
             onDelete={(id) => remove('texts', id)} onFakeCall={onFakeCall} />
@@ -809,7 +967,17 @@ function Agenda({ s, T, data, updateData, onBrief, intent, onIntentHandled, onFa
             saveEdit(patch);
           }} />
       )}
-      {editing && editing.kind !== 'text' && <EditSheet s={s} T={T} {...editing} onClose={() => setEditing(null)} onSave={saveEdit} />}
+      {editing && editing.kind === 'waiting' && <WaitingSheet s={s} T={T} {...editing} people={data.people || []} onClose={() => setEditing(null)} onSave={saveEdit} />}
+      {editing && editing.kind === 'person' && <PersonSheet s={s} T={T} {...editing} onClose={() => setEditing(null)} onSave={saveEdit} />}
+      {editing && !['text', 'waiting', 'person'].includes(editing.kind) && (
+        <EditSheet s={s} T={T} {...editing} onClose={() => setEditing(null)}
+          onSave={async (patch) => {
+            if (patch.autoAsk && nativeAvailable && !(await hasSmsPermission())) {
+              if (!(await requestSmsPermission())) Alert.alert('SMS permission denied', 'The task is saved, but the automatic update request will not send until you allow SMS in app settings.');
+            }
+            saveEdit(patch);
+          }} />
+      )}
     </View>
   );
 }
@@ -1289,6 +1457,14 @@ function EditSheet({ s, T, kind, item, isNew, onSave, onClose }) {
   const [loc, setLoc] = useState(item.location || '');
   const [repeat, setRepeat] = useState(item.repeat || 'none');
   const [err, setErr] = useState('');
+  const [priority, setPriority] = useState(item.priority || 'normal');
+  const [aName, setAName] = useState((item.assignee && item.assignee.name) || '');
+  const [aNum, setANum] = useState((item.assignee && item.assignee.number) || '');
+  const [autoAsk, setAutoAsk] = useState(!!item.autoAsk);
+  const [attendees, setAttendees] = useState(item.attendees || '');
+  const [agenda, setAgenda] = useState(item.agenda || '');
+  const [mNotes, setMNotes] = useState(item.meetingNotes || '');
+  const [picking, setPicking] = useState(false);
 
   const save = () => {
     if (kind === 'note') {
@@ -1298,10 +1474,11 @@ function EditSheet({ s, T, kind, item, isNew, onSave, onClose }) {
     if (!title.trim()) return setErr('Title is required.');
     if (kind === 'event') {
       if (!when) return setErr('Events need a start date.');
-      return onSave({ title: title.trim(), start: when, location: loc.trim(), repeat });
+      return onSave({ title: title.trim(), start: when, location: loc.trim(), repeat, attendees: attendees.trim(), agenda: agenda.trim(), meetingNotes: mNotes.trim() });
     }
     if (repeat !== 'none' && !when) return setErr('Pick a due date to repeat this task.');
-    onSave({ title: title.trim(), due: when || null, repeat: when ? repeat : 'none' });
+    const assignee = aName.trim() ? { name: aName.trim(), number: aNum.trim() } : null;
+    onSave({ title: title.trim(), due: when || null, repeat: when ? repeat : 'none', priority: priority === 'high' ? 'high' : null, assignee, autoAsk: !!(autoAsk && assignee && assignee.number && when) });
   };
 
   const clear = () => setErr('');
@@ -1354,6 +1531,46 @@ function EditSheet({ s, T, kind, item, isNew, onSave, onClose }) {
               <>
                 <Text style={s.label}>Location (optional)</Text>
                 <TextInput style={s.field} value={loc} onChangeText={setLoc} placeholderTextColor={T.muted} />
+                <Text style={s.label}>Who is attending (optional)</Text>
+                <TextInput style={s.field} value={attendees} onChangeText={setAttendees} placeholder="Names, separated by commas" placeholderTextColor={T.muted} />
+                <Text style={s.label}>Agenda (optional)</Text>
+                <TextInput style={[s.field, { minHeight: 80, textAlignVertical: 'top' }]} value={agenda} onChangeText={setAgenda} multiline placeholder="Talking points" placeholderTextColor={T.muted} />
+                {!isNew && (
+                  <>
+                    <Text style={s.label}>Notes from the meeting</Text>
+                    <TextInput style={[s.field, { minHeight: 80, textAlignVertical: 'top' }]} value={mNotes} onChangeText={setMNotes} multiline placeholder="Decisions, who owns what" placeholderTextColor={T.muted} />
+                  </>
+                )}
+              </>
+            )}
+            {kind === 'task' && (
+              <>
+                <Text style={s.label}>Priority</Text>
+                <View style={[s.seg, { marginBottom: 14 }]}>
+                  {[['normal', 'Normal'], ['high', '🔴 Urgent']].map(([v, l]) => (
+                    <Pressable key={v} style={[s.segItem, priority === v && s.segActive]} onPress={() => setPriority(v)}>
+                      <Text style={[s.segText, priority === v && { color: T.onPrimary, fontWeight: '700' }]}>{l}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={s.label}>Delegate to (optional)</Text>
+                <View style={s.keyRow}>
+                  <TextInput style={[s.field, s.flex1, { marginBottom: 0 }]} value={aName} onChangeText={setAName} placeholder="Name" placeholderTextColor={T.muted} />
+                  <Pressable onPress={() => setPicking(true)} style={s.showBtn}><Text style={{ color: T.primary, fontWeight: '600' }}>Contacts</Text></Pressable>
+                </View>
+                {aName.trim() ? (
+                  <>
+                    <TextInput style={[s.field, { marginTop: 8 }]} value={aNum} onChangeText={setANum} keyboardType="phone-pad" placeholder="Their number (+255…)" placeholderTextColor={T.muted} />
+                    <View style={[s.keyRow, { marginBottom: 14 }]}>
+                      <View style={s.flex1}>
+                        <Text style={[s.label, { marginBottom: 2 }]}>Text them for an update</Text>
+                        <Text style={[s.muted, { marginTop: 0 }]}>Sends an SMS the day before it is due (needs a due date and number).</Text>
+                      </View>
+                      <Switch value={autoAsk} onValueChange={setAutoAsk} trackColor={{ true: T.primary }} />
+                    </View>
+                  </>
+                ) : <View style={{ height: 14 }} />}
+                {picking && <ContactPicker T={T} onClose={() => setPicking(false)} onDone={(l) => { setPicking(false); if (l[0]) { setAName(l[0].name || aName); setANum(l[0].number); } }} />}
               </>
             )}
             {err ? <Text style={{ color: T.danger, marginBottom: 10 }}>{err}</Text> : null}
@@ -1373,7 +1590,7 @@ const Empty = ({ s, icon, text }) => (
 );
 
 // ---------- settings ----------
-function Settings({ s, T, keys, name, assistant, prefs, changePrefs, onSave }) {
+function Settings({ s, T, keys, name, assistant, prefs, changePrefs, toggleCalendar, onSave }) {
   const [ks, setKs] = useState(keys);
   const provider = prefs.provider || 'claude';
   const k = ks[provider] || '';
@@ -1437,6 +1654,39 @@ function Settings({ s, T, keys, name, assistant, prefs, changePrefs, onSave }) {
       </View>
 
       <View style={s.panel}>
+        <Text style={s.label}>Executive assistant</Text>
+        <View style={s.keyRow}>
+          <View style={s.flex1}>
+            <Text style={[s.label, { marginBottom: 2 }]}>Use my phone calendar</Text>
+            <Text style={[s.muted, { marginTop: 0 }]}>Read-only. Jolly sees your Google/phone calendar, warns about clashes and finds free slots.</Text>
+          </View>
+          <Switch value={!!prefs.calendar} onValueChange={toggleCalendar} trackColor={{ true: T.primary }} />
+        </View>
+        <View style={[s.keyRow, { marginTop: 16 }]}>
+          <View style={s.flex1}>
+            <Text style={[s.label, { marginBottom: 2 }]}>Evening wrap-up</Text>
+            <Text style={[s.muted, { marginTop: 0 }]}>What is still open and a preview of tomorrow.</Text>
+          </View>
+          <Switch value={!!prefs.wrapup} onValueChange={(v) => changePrefs({ wrapup: v })} trackColor={{ true: T.primary }} />
+        </View>
+        {prefs.wrapup && (
+          <View style={[s.keyRow, { marginTop: 10 }]}>
+            <Text style={[s.muted, s.flex1, { marginTop: 0 }]}>Deliver at</Text>
+            <TimeField s={s} T={T} value={prefs.wrapupTime} onChange={(v) => changePrefs({ wrapupTime: v })} />
+          </View>
+        )}
+        {speechAvailable && (
+          <View style={[s.keyRow, { marginTop: 16 }]}>
+            <View style={s.flex1}>
+              <Text style={[s.label, { marginBottom: 2 }]}>Read briefings aloud</Text>
+              <Text style={[s.muted, { marginTop: 0 }]}>When you open a briefing or wrap-up, Jolly speaks it.</Text>
+            </View>
+            <Switch value={!!prefs.speakBriefing} onValueChange={(v) => changePrefs({ speakBriefing: v })} trackColor={{ true: T.primary }} />
+          </View>
+        )}
+      </View>
+
+      <View style={s.panel}>
         <Text style={s.label}>AI provider</Text>
         <View style={[s.seg, { marginBottom: 14 }]}>
           {[['claude', 'Claude'], ['gemini', 'Gemini']].map(([v, l]) => (
@@ -1470,6 +1720,233 @@ function Settings({ s, T, keys, name, assistant, prefs, changePrefs, onSave }) {
   );
 }
 
+// ---------- executive-assistant pieces: messaging helpers, follow-ups, people ----------
+const firstName = (n) => (n || '').trim().split(/\s+/)[0] || 'there';
+
+function sendMessage(channel, number, text) {
+  const num = normalizeNumber(number);
+  if (!num) return Share.share({ message: text }).catch(() => {});
+  const url = channel === 'whatsapp'
+    ? `https://wa.me/${num.replace(/\D/g, '')}?text=${encodeURIComponent(text)}`
+    : `sms:${num}?body=${encodeURIComponent(text)}`;
+  return Linking.openURL(url).catch(() => Alert.alert('Could not open the app', 'Check that you have a messaging app installed.'));
+}
+
+// Asks how to send a message, then opens that app with the text ready (you still tap send).
+function askChannel({ name, number, text }) {
+  if (!normalizeNumber(number)) return Share.share({ message: text }).catch(() => {});
+  Alert.alert(`Message ${name || number}`, text, [
+    { text: 'SMS', onPress: () => sendMessage('sms', number, text) },
+    { text: 'WhatsApp', onPress: () => sendMessage('whatsapp', number, text) },
+    { text: 'Cancel', style: 'cancel' },
+  ]);
+}
+
+const daysAgo = (stored) => {
+  const d = parseLocal(stored);
+  if (!d) return '';
+  const n = Math.floor((startOfDay().getTime() - startOfDay(d).getTime()) / 86400000);
+  return n <= 0 ? 'today' : n === 1 ? 'yesterday' : `${n} days ago`;
+};
+
+function Sheet({ s, T, title, onClose, onSave, saveLabel, err, children }) {
+  const kb = useKeyboardHeight();
+  const { height: winH } = useWindowDimensions();
+  return (
+    <Modal transparent animationType="slide" onRequestClose={onClose}>
+      <View style={[s.modalWrap, { paddingBottom: kb }]}>
+        <Pressable style={{ flex: 1 }} onPress={onClose} />
+        <View style={s.sheet}>
+          <ScrollView keyboardShouldPersistTaps="handled" style={{ maxHeight: Math.max(220, winH - kb - 160) }}>
+            <Text style={s.sheetTitle}>{title}</Text>
+            {children}
+            {err ? <Text style={{ color: T.danger, marginBottom: 10 }}>{err}</Text> : null}
+          </ScrollView>
+          <View style={s.sheetBtns}>
+            <Pressable style={s.ghostBtn} onPress={onClose}><Text style={{ color: T.text, fontWeight: '600' }}>Cancel</Text></Pressable>
+            <Pressable style={[s.primaryBtn, s.flex1]} onPress={onSave}><Text style={{ color: T.onPrimary, fontWeight: '700' }}>{saveLabel}</Text></Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function WaitingSheet({ s, T, item, isNew, people, onSave, onClose }) {
+  const [what, setWhat] = useState(item.what || '');
+  const [who, setWho] = useState(item.who || '');
+  const [number, setNumber] = useState(item.number || '');
+  const [due, setDue] = useState(item.due || (isNew ? toStored(new Date(Date.now() + 86400000), false) : ''));
+  const [picking, setPicking] = useState(false);
+  const [err, setErr] = useState('');
+  const save = () => {
+    if (!what.trim()) return setErr('Say what you are waiting for.');
+    onSave({ what: what.trim(), who: who.trim(), number: number.trim(), due: due || null });
+  };
+  return (
+    <Sheet s={s} T={T} title={`${isNew ? 'New' : 'Edit'} follow-up`} onClose={onClose} onSave={save} saveLabel={isNew ? 'Add' : 'Save'} err={err}>
+      <Text style={s.label}>Waiting for</Text>
+      <TextInput style={s.field} value={what} onChangeText={(v) => { setWhat(v); setErr(''); }} autoFocus={isNew}
+        placeholder="e.g. Signed contract, budget numbers" placeholderTextColor={T.muted} />
+      <Text style={s.label}>From</Text>
+      <View style={s.keyRow}>
+        <TextInput style={[s.field, s.flex1, { marginBottom: 0 }]} value={who} onChangeText={setWho} placeholder="Name" placeholderTextColor={T.muted} />
+        <Pressable onPress={() => setPicking(true)} style={s.showBtn}><Text style={{ color: T.primary, fontWeight: '600' }}>Contacts</Text></Pressable>
+      </View>
+      {people.length > 0 && (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0, marginTop: 8 }} keyboardShouldPersistTaps="handled">
+          {people.slice(0, 12).map((p) => (
+            <Pressable key={p.id} style={[s.chip, { marginRight: 8 }]} onPress={() => { setWho(p.name); setNumber(p.number || ''); }}>
+              <Text style={s.chipText}>{p.name}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      )}
+      <Text style={[s.label, { marginTop: 14 }]}>Their number (to send a nudge)</Text>
+      <TextInput style={s.field} value={number} onChangeText={setNumber} keyboardType="phone-pad" placeholder="+255…" placeholderTextColor={T.muted} />
+      <Text style={s.label}>Chase me on</Text>
+      <DateTimeField s={s} T={T} value={due} onChange={setDue} optional />
+      {picking && <ContactPicker T={T} onClose={() => setPicking(false)} onDone={(l) => { setPicking(false); if (l[0]) { setWho(l[0].name || who); setNumber(l[0].number); } }} />}
+    </Sheet>
+  );
+}
+
+const EVERY = [[0, 'Off'], [14, '2 wks'], [30, 'Monthly'], [60, '2 mths'], [90, 'Quarterly']];
+
+function PersonSheet({ s, T, item, isNew, onSave, onClose }) {
+  const [name, setName] = useState(item.name || '');
+  const [number, setNumber] = useState(item.number || '');
+  const [role, setRole] = useState(item.role || '');
+  const [notes, setNotes] = useState(item.notes || '');
+  const [every, setEvery] = useState(item.every || 0);
+  const [picking, setPicking] = useState(false);
+  const [err, setErr] = useState('');
+  const save = () => {
+    if (!name.trim()) return setErr('Add a name.');
+    onSave({ name: name.trim(), number: number.trim(), role: role.trim(), notes: notes.trim(), every });
+  };
+  return (
+    <Sheet s={s} T={T} title={`${isNew ? 'New' : 'Edit'} person`} onClose={onClose} onSave={save} saveLabel={isNew ? 'Add' : 'Save'} err={err}>
+      <Text style={s.label}>Name</Text>
+      <View style={s.keyRow}>
+        <TextInput style={[s.field, s.flex1, { marginBottom: 0 }]} value={name} onChangeText={(v) => { setName(v); setErr(''); }} autoFocus={isNew}
+          placeholder="Who is it?" placeholderTextColor={T.muted} />
+        <Pressable onPress={() => setPicking(true)} style={s.showBtn}><Text style={{ color: T.primary, fontWeight: '600' }}>Contacts</Text></Pressable>
+      </View>
+      <Text style={[s.label, { marginTop: 14 }]}>Role / company</Text>
+      <TextInput style={s.field} value={role} onChangeText={setRole} placeholder="e.g. CFO at Acme, investor" placeholderTextColor={T.muted} />
+      <Text style={s.label}>Phone</Text>
+      <TextInput style={s.field} value={number} onChangeText={setNumber} keyboardType="phone-pad" placeholder="+255…" placeholderTextColor={T.muted} />
+      <Text style={s.label}>Notes</Text>
+      <TextInput style={[s.field, { minHeight: 100, textAlignVertical: 'top' }]} value={notes} onChangeText={setNotes} multiline
+        placeholder="Preferences, family, what you last discussed…" placeholderTextColor={T.muted} />
+      <Text style={s.label}>Remind me to check in</Text>
+      <View style={[s.seg, { marginBottom: 14 }]}>
+        {EVERY.map(([v, l]) => (
+          <Pressable key={v} style={[s.segItem, every === v && s.segActive]} onPress={() => setEvery(v)}>
+            <Text style={[s.segText, every === v && { color: T.onPrimary, fontWeight: '700' }]} numberOfLines={1}>{l}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {picking && <ContactPicker T={T} onClose={() => setPicking(false)} onDone={(l) => { setPicking(false); if (l[0]) { setName(name || l[0].name || ''); setNumber(l[0].number); } }} />}
+    </Sheet>
+  );
+}
+
+function MiniBtn({ s, T, icon, label, onPress, tone }) {
+  const color = tone === 'ok' ? T.success : T.primary;
+  return (
+    <Pressable onPress={onPress} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, backgroundColor: T.primarySoft }} accessibilityLabel={label}>
+      <Ionicons name={icon} size={15} color={color} />
+      <Text style={{ color, fontWeight: '700', fontSize: 12.5 }}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function WaitingPanel({ s, T, list, onEdit, onResolve, onDelete }) {
+  const today = localDay();
+  const open = list.filter((w) => !w.done).sort((a, b) => (a.due || '9').localeCompare(b.due || '9'));
+  const done = list.filter((w) => w.done);
+  const Card = ({ w }) => {
+    const late = !w.done && w.due && w.due.slice(0, 10) <= today;
+    return (
+      <Pressable style={[s.card, { alignItems: 'flex-start' }, w.done && { opacity: 0.5 }]} onPress={() => onEdit(w)}>
+        <View style={s.flex1}>
+          <Text style={[s.cardTitle, w.done && { textDecorationLine: 'line-through' }]}>{w.what}</Text>
+          <Text style={[s.muted, late && { color: T.danger, fontWeight: '700' }]}>
+            {w.who ? `From ${w.who}` : 'No name'}{w.due ? ` · ${late ? 'Chase now' : 'Chase ' + fmt(w.due)}` : ''}
+          </Text>
+          {!w.done && (
+            <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+              <MiniBtn s={s} T={T} icon="chatbubble-ellipses-outline" label="Nudge" onPress={() =>
+                askChannel({ name: w.who, number: w.number, text: `Hi ${firstName(w.who)}, just following up on: ${w.what}. Could you give me an update? Thanks.` })} />
+              <MiniBtn s={s} T={T} icon="checkmark-done" label="Received" tone="ok" onPress={() => onResolve(w.id)} />
+            </View>
+          )}
+        </View>
+        <Pressable onPress={() => onDelete(w.id)} hitSlop={10} accessibilityLabel="Delete"><Ionicons name="close" size={20} color={T.muted} /></Pressable>
+      </Pressable>
+    );
+  };
+  if (!list.length) return <Empty s={s} icon="⏳" text="Nothing pending. Add what you are waiting on from others (a reply, a document, a decision). I'll remind you to chase it." />;
+  return (
+    <>
+      {open.map((w) => <Card key={w.id} w={w} />)}
+      {done.length > 0 && <Text style={s.section}>Received</Text>}
+      {done.map((w) => <Card key={w.id} w={w} />)}
+    </>
+  );
+}
+
+function PeoplePanel({ s, T, list, onEdit, onContacted, onDelete }) {
+  const today = new Date();
+  const sorted = [...list].sort((a, b) => {
+    const da = reachOutDue(a);
+    const db = reachOutDue(b);
+    return (da ? +da : Infinity) - (db ? +db : Infinity) || a.name.localeCompare(b.name);
+  });
+  if (!list.length) return <Empty s={s} icon="👥" text="Keep a card for the people who matter: role, notes and how often to check in. Jolly uses them to prep you for meetings." />;
+  return sorted.map((p) => {
+    const due = reachOutDue(p);
+    const late = due && due <= today;
+    return (
+      <Pressable key={p.id} style={[s.card, { alignItems: 'flex-start' }]} onPress={() => onEdit(p)}>
+        <View style={[s.avatar, { width: 38, height: 38, borderRadius: 19 }]}><Text style={s.avatarText}>{(p.name[0] || '?').toUpperCase()}</Text></View>
+        <View style={s.flex1}>
+          <Text style={s.cardTitle}>{p.name}</Text>
+          {p.role ? <Text style={s.muted}>{p.role}</Text> : null}
+          <Text style={[s.muted, late && { color: T.danger, fontWeight: '700' }]}>
+            {p.last ? `Last spoke ${daysAgo(p.last)}` : 'Not contacted yet'}{late ? ' · check-in due' : due ? ` · next ${fmt(toStored(due, false))}` : ''}
+          </Text>
+          {p.notes ? <Text style={[s.muted, { marginTop: 6 }]} numberOfLines={2}>{p.notes}</Text> : null}
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            {p.number ? <MiniBtn s={s} T={T} icon="call-outline" label="Call" onPress={() => placeCall(p.number, p.name)} /> : null}
+            {p.number ? <MiniBtn s={s} T={T} icon="chatbubble-ellipses-outline" label="Message" onPress={() => askChannel({ name: p.name, number: p.number, text: `Hi ${firstName(p.name)}, ` })} /> : null}
+            <MiniBtn s={s} T={T} icon="checkmark-done" label="Spoke today" tone="ok" onPress={() => onContacted(p.id)} />
+          </View>
+        </View>
+        <Pressable onPress={() => onDelete(p.id)} hitSlop={10} accessibilityLabel="Delete"><Ionicons name="close" size={20} color={T.muted} /></Pressable>
+      </Pressable>
+    );
+  });
+}
+
+// Message drafted by the assistant: you review it, then send with one tap.
+function DraftCards({ s, T, drafts }) {
+  return drafts.map((d, i) => (
+    <View key={i} style={{ marginTop: 10, padding: 12, borderRadius: 12, backgroundColor: T.primarySoft }}>
+      <Text style={{ color: T.muted, fontSize: 12, fontWeight: '700' }}>DRAFT TO {String(d.to || '').toUpperCase()}{d.number ? ` · ${d.number}` : ''}</Text>
+      <Text selectable style={{ color: T.text, fontSize: 15, lineHeight: 21, marginTop: 6 }}>{d.text}</Text>
+      <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+        <MiniBtn s={s} T={T} icon="chatbubble-outline" label="SMS" onPress={() => sendMessage('sms', d.number, d.text)} />
+        <MiniBtn s={s} T={T} icon="logo-whatsapp" label="WhatsApp" onPress={() => sendMessage('whatsapp', d.number, d.text)} />
+        <MiniBtn s={s} T={T} icon="share-outline" label="Share" onPress={() => Share.share({ message: d.text }).catch(() => {})} />
+      </View>
+      {!d.number ? <Text style={{ color: T.warn, fontSize: 12, marginTop: 8 }}>No number saved for this person, so tapping SMS or WhatsApp will share the text so you can pick the chat yourself.</Text> : null}
+    </View>
+  ));
+}
+
 // ---------- styles ----------
 const makeStyles = (T) =>
   StyleSheet.create({
@@ -1487,8 +1964,8 @@ const makeStyles = (T) =>
       borderRadius: 32, padding: 6, borderWidth: StyleSheet.hairlineWidth, borderColor: T.border,
       shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 14, shadowOffset: { width: 0, height: 4 }, elevation: 8,
     },
-    navItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, height: 48, minWidth: 56, paddingHorizontal: 16, borderRadius: 26 },
-    navItemActive: { backgroundColor: T.primarySoft, flexGrow: 1.4 },
+    navItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, height: 48, minWidth: 46, paddingHorizontal: 11, borderRadius: 26 },
+    navItemActive: { backgroundColor: T.primarySoft, flexGrow: 1.2 },
     navLabel: { color: T.primary, fontWeight: '700', fontSize: 14 },
     navBadge: { position: 'absolute', top: -5, right: -9, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: T.danger, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
     tabs: { flexDirection: 'row', backgroundColor: T.card, borderTopWidth: StyleSheet.hairlineWidth, borderColor: T.border, paddingTop: 6 },

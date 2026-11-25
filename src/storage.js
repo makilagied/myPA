@@ -6,7 +6,7 @@ const DATA_KEY = 'mypa.data.v1';
 const KEY_NAME = 'mypa.apikey';
 const NAME_KEY = 'mypa.username';
 
-const empty = { tasks: [], notes: [], events: [], texts: [] };
+const empty = { tasks: [], notes: [], events: [], texts: [], waiting: [], people: [] };
 
 export async function loadData() {
   try {
@@ -78,7 +78,8 @@ export async function setAssistantName(name) {
 export const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
 const PREFS_KEY = 'mypa.prefs';
-export const defaultPrefs = { theme: 'system', reminders: true, briefing: false, briefingTime: '08:00', voiceLang: 'en-US', provider: 'claude', geminiModel: 'gemini-flash-latest' };
+export const defaultPrefs = { theme: 'system', reminders: true, briefing: false, briefingTime: '08:00', voiceLang: 'en-US', provider: 'claude', geminiModel: 'gemini-flash-latest',
+  calendar: false, wrapup: false, wrapupTime: '18:00', speakBriefing: false };
 
 export async function getPrefs() {
   try {

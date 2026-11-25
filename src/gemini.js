@@ -45,6 +45,7 @@ function toContents(messages) {
 export async function askGemini({ apiKey, model, userName, assistantName, messages, data }) {
   let convo = [...messages];
   let current = data;
+  const drafts = [];
 
   for (let i = 0; i < 8; i++) {
     const res = await fetch(`${BASE}${encodeURIComponent(model || DEFAULT_GEMINI_MODEL)}:generateContent`, {
@@ -85,17 +86,18 @@ export async function askGemini({ apiKey, model, userName, assistantName, messag
 
     if (!calls.length) {
       const reply = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
-      return { messages: convo, data: current, reply };
+      return { messages: convo, data: current, reply, drafts };
     }
 
     const results = [];
     for (const c of calls) {
       const out = runTool(c.name, c.input, current);
       current = out.data;
+      if (out.draft) drafts.push(out.draft);
       results.push({ type: 'tool_result', tool_use_id: c.id, content: out.result });
     }
     convo.push({ role: 'user', content: results });
   }
 
-  return { messages: convo, data: current, reply: 'Sorry, I got stuck. Please try again.' };
+  return { messages: convo, data: current, reply: 'Sorry, I got stuck. Please try again.', drafts };
 }

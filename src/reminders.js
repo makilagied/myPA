@@ -1,6 +1,7 @@
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
-import { buildBriefing, occurrences, parseLocal, startOfDay, upcoming } from './dates';
+import { buildBriefing, buildWrapup, occurrences, parseLocal, reachOutDue, startOfDay, upcoming } from './dates';
+import { deviceEvents } from './calendar';
 
 try {
   Notifications.setNotificationHandler({
@@ -55,7 +56,7 @@ export async function syncReminders(data, prefs) {
         .map((n) => Notifications.cancelScheduledNotificationAsync(n.identifier)),
     );
     const whatsapp = (data.texts || []).filter((t) => (t.type || 'text') === 'text' && t.channel === 'whatsapp' && t.status === 'scheduled');
-    if (!prefs.reminders && !prefs.briefing && !whatsapp.length) return;
+    if (!prefs.reminders && !prefs.briefing && !prefs.wrapup && !whatsapp.length) return;
     if (!(await ensurePermission())) return;
 
     const now = Date.now();
@@ -73,7 +74,7 @@ export async function syncReminders(data, prefs) {
       for (const t of data.tasks) {
         if (t.done || !t.due) continue;
         const at = parseLocal(t.due);
-        if (at) items.push({ at, repeat: t.repeat, title: 'Task due', body: t.title });
+        if (at) items.push({ at, repeat: t.repeat, title: t.priority === 'high' ? '🔴 Urgent task due' : 'Task due', body: t.title });
       }
       for (const e of data.events) {
         const d = parseLocal(e.start);
@@ -86,10 +87,28 @@ export async function syncReminders(data, prefs) {
           body: e.location || 'Event today',
         });
       }
+      // Follow-ups you are waiting on: nudge on the chase date.
+      for (const w of data.waiting || []) {
+        if (w.done || !w.due) continue;
+        const at = parseLocal(w.due);
+        if (at) items.push({ at, repeat: 'none', title: 'Follow up', body: `${w.who ? w.who + ': ' : ''}${w.what}`, data: { type: 'waiting' } });
+      }
+      // People to stay in touch with: remind when a check-in is due (or tomorrow 9:00 if already overdue).
+      for (const p of data.people || []) {
+        const due = reachOutDue(p);
+        if (!due) continue;
+        let at = due;
+        if (at.getTime() <= now + 60000) {
+          at = new Date(now);
+          at.setHours(9, 0, 0, 0);
+          if (at.getTime() <= now + 60000) at.setDate(at.getDate() + 1);
+        }
+        items.push({ at, repeat: 'none', title: 'Stay in touch', body: `Reach out to ${p.name}${p.role ? ' (' + p.role + ')' : ''}`, data: { type: 'person' } });
+      }
       items.sort((a, b) => a.at - b.at);
 
       for (const i of items) {
-        const content = { title: i.title, body: i.body };
+        const content = { title: i.title, body: i.body, ...(i.data ? { data: i.data } : {}) };
         if (!i.repeat || i.repeat === 'none') {
           await once(content, i.at);
         } else if (i.at.getTime() > now) {
@@ -124,8 +143,19 @@ export async function syncReminders(data, prefs) {
         const day = new Date(startOfDay().getTime());
         day.setDate(day.getDate() + i);
         const at = new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, m);
-        const { title, body } = buildBriefing(data, day);
+        const { title, body } = buildBriefing(data, day, deviceEvents());
         await once({ title, body, data: { type: 'briefing' } }, at);
+      }
+    }
+
+    if (prefs.wrapup) {
+      const [h, m] = (prefs.wrapupTime || '18:00').split(':').map(Number);
+      for (let i = 0; i < 7; i++) {
+        const day = new Date(startOfDay().getTime());
+        day.setDate(day.getDate() + i);
+        const at = new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, m);
+        const { title, body } = buildWrapup(data, day, deviceEvents());
+        await once({ title, body, data: { type: 'wrapup' } }, at);
       }
     }
   } catch {}
